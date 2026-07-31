@@ -1,21 +1,19 @@
 {
-    "name":"Example Listing",
-    "id":"com.vrchat.example-listing",
-    "url":"https://vrchat-community.github.io/template-package-listing/index.json",
+    "name":"FTTristan's VRChat Packages",
+    "id":"com.fttristan.vpm",
+    "url":"https://vcc.fttristan.vrcband.com/index.json",
     "author":{
-        "email":"developer@vrchat.com",
-        "name":"VRChat",
-        "url":"https://hello.vrchat.com"
+        "email":"webmaster@vrcband.com",
+        "name":"FTTristan",
+        "url":"https://www.chillboiostudios.com"
     },
-    "description":"Example listing of VRChat packages",
+    "description":"My VRChat Packages",
     "infoLink":{
-        "url":"http://github.com/vrchat-community/template-package-listing",
+        "url":"https://github.com/FTTristan-s-VRC-Stuff/VCC-Package-Listings",
         "text":"View on GitHub"
     },
     "bannerUrl":"banner.png",
-    "githubRepos":[
-        "vrchat-community/clientsim"
-    ],
+    "githubRepos":[],
     "packages":[
         {
             "name":"com.vrchat.udonsharp",
