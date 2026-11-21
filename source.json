@@ -9,12 +9,12 @@
     },
     "description":"My VRChat Packages",
     "infoLink":{
-        "url":"https://github.com/FTTristan-s-VRC-Stuff/VCC-Package-Listings",
+        "url":"https://github.com/FTTristans-Creations/VCC-Package-Listings",
         "text":"View on GitHub"
     },
     "bannerUrl":"banner.png",
     "githubRepos":[
-        "vrchat-community/template-package"
+        "FTTristans-Creations/CCKAdvanced"
     ],
     "packages":[
         {
