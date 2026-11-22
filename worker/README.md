@@ -22,7 +22,25 @@ Per cache miss the Worker makes **one** GitHub API call (releases list)
 plus asset downloads only for versions not yet hashed — release asset
 downloads don't count against the API rate limit.
 
-## Setup
+## CI deploy
+
+`.github/workflows/deploy-worker.yml` deploys automatically on every push
+to `worker/**` (and via manual dispatch). Repo secrets required:
+
+| Secret | Value |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | API token with **Workers Scripts: Edit** on your account |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID (dashboard → Workers overview, right sidebar) |
+| `LISTING_GITHUB_PAT` | Fine-grained PAT, read-only contents on `FTTristans-Creations/CCKAdvanced` — synced into the Worker as `GITHUB_TOKEN` on each deploy |
+
+The KV namespace id still has to be created once by hand and pasted into
+`wrangler.toml` — CI can't invent it:
+
+```bash
+wrangler kv namespace create LISTING_CACHE   # paste id into wrangler.toml, commit
+```
+
+## Manual deploy (alternative)
 
 ```bash
 cd worker
@@ -32,9 +50,7 @@ wrangler login
 # 1. Create the KV namespace and paste its id into wrangler.toml
 wrangler kv namespace create LISTING_CACHE
 
-# 2. (Recommended) GitHub token so the releases call isn't limited by
-#    shared Worker egress IPs. Fine-grained PAT, read-only on
-#    FTTristans-Creations/CCKAdvanced is enough.
+# 2. GitHub token (optional locally; CI syncs it from LISTING_GITHUB_PAT)
 wrangler secret put GITHUB_TOKEN
 
 # 3. Deploy
