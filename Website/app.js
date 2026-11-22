@@ -9,6 +9,15 @@ const PACKAGES = {};
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+// Mirrors GetPackageType in package-list-action's Build.cs: Avatar if the
+// manifest depends on avatar packages, World for world packages, else Any.
+function packageType(v) {
+  const deps = Object.keys(v.allDeps || {});
+  if (deps.some(d => d.toLowerCase().includes('avatar'))) return 'Avatar';
+  if (deps.some(d => d.toLowerCase().includes('world'))) return 'World';
+  return 'Any';
+}
+
 const semverParts = v => String(v).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
 const compareSemverDesc = (a, b) => {
   const pa = semverParts(a), pb = semverParts(b);
@@ -36,7 +45,8 @@ async function loadPackages() {
         description: v.description || '',
         version: latest,
         author: v.author || { name: '', url: '#' },
-        dependencies: v.dependencies || v.vpmDependencies || {},
+        dependencies: v.vpmDependencies || v.dependencies || {},
+        allDeps: { ...(v.dependencies || {}), ...(v.vpmDependencies || {}) },
         keywords: v.keywords || [],
         license: v.license || '',
         licensesUrl: v.licensesUrl || '',
@@ -55,7 +65,7 @@ async function loadPackages() {
           </div>
         </fluent-data-grid-cell>
         <fluent-data-grid-cell grid-column="2" class="row align-items-center">
-          Any
+          ${esc(packageType(PACKAGES[id]))}
         </fluent-data-grid-cell>
         <fluent-data-grid-cell grid-column="3" class="row align-items-center justify-content-end">
           <fluent-button appearance="accent" class="rowAddToVccButton" data-package-id="${esc(id)}">Add to VCC</fluent-button>

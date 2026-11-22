@@ -22,6 +22,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Worker dependencies
+        run: npm ci
+
       - name: Stage source.json for the Worker
         working-directory: ${{ github.workspace }}
         run: cp source.json Website/source.json

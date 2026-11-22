@@ -4,24 +4,34 @@
 // and generates index.json on demand from GitHub, driven by source.json
 // (copied into Website/ at deploy time, so it is served as a static asset).
 //
-// For every repo in source.json's githubRepos the Worker discovers all
-// package.json manifests via the GitHub tree API, then lists a package
-// version for each release that ships a matching "{name}-{version}.zip"
-// asset (dots in the package name may appear as dashes — both are tried).
+// Mirrors vrchat-community/package-list-action (PackageBuilder/Build.cs):
+// for every repo in source.json's githubRepos it scans release assets for
+// zips that look like VPM packages, downloads each candidate zip, and reads
+// package.json from the ZIP ROOT — zips without one are skipped, exactly
+// like upstream. All listing metadata therefore comes from the packaged
+// manifest, not the repo's package.json on the default branch.
+//
+// Repo manifests are still discovered via the GitHub tree API, but only as
+// a candidate-name filter: upstream downloads EVERY .zip asset (including
+// huge payload archives), which is not viable per-request. A zip is a
+// candidate when its filename starts with "{pkgname}-" (dots or dashes)
+// followed by a digit — matching the "{name}-{version}.zip" convention.
 //
 // Caching (one KV namespace):
 //   index                  -> finished listing JSON, expires after 60s
 //   index:stale            -> last good listing, never expires
 //   repometa:{repo}        -> repo default branch, 1h
 //   manifests:{repo}:{br}  -> discovered package.json manifests, 1h
-//   sha256:{url}           -> release asset hash, ~30d (immutable)
+//   asset:{url}            -> { sha256, manifest } for a release zip, ~30d
 //
 // Worst case GitHub traffic is ~1 releases call per repo per minute plus
 // tree/raw fetches only when the hourly manifest cache expires.
 
+import { unzipSync, strFromU8 } from "fflate";
+
 const LISTING_TTL = 60;            // seconds; ~1 GitHub refresh per minute max
 const META_TTL = 60 * 60;          // repo meta + manifests
-const SHA_TTL = 60 * 60 * 24 * 30; // 30 days
+const ASSET_TTL = 60 * 60 * 24 * 30; // 30 days; release assets are immutable
 
 interface Env {
   LISTING_CACHE: KVNamespace;
@@ -72,31 +82,51 @@ async function buildIndex(request: Request, env: Env): Promise<string> {
 
     for (const rel of releases) {
       if (rel.draft) continue;
-      const version = String(rel.tag_name ?? rel.name ?? "").replace(/^v/, "");
-      if (!version) continue;
+      const tagVersion = String(rel.tag_name ?? rel.name ?? "").replace(/^v/, "");
+      if (!tagVersion) continue;
 
+      // Candidate zips across every known package name, deduped by URL.
+      const candidates = new Map<string, string>();
       for (const m of manifests) {
-        const asset = findAsset(rel.assets ?? [], m.name, version);
-        if (!asset?.browser_download_url) continue;
+        for (const asset of rel.assets ?? []) {
+          if (typeof asset?.browser_download_url !== "string") continue;
+          if (!isCandidateZip(asset.name, m.name)) continue;
+          candidates.set(asset.browser_download_url, asset.name);
+        }
+      }
 
-        const sha = await getSha256(env, asset.browser_download_url);
-        const pkg = packages[m.name] ?? (packages[m.name] = { versions: {} });
-        pkg.versions[version] = {
-          name: m.name,
-          displayName: m.pkg.displayName,
+      for (const url of candidates.keys()) {
+        const info = await getAssetInfo(env, url);
+        const pkg = info?.manifest;
+        // Upstream skips zips with no package.json at the root.
+        if (!pkg || typeof pkg.name !== "string" || !pkg.name) continue;
+
+        // Upstream uses the manifest's own version field; fall back to the
+        // release tag when the packaged manifest omits it.
+        const version = String(pkg.version || tagVersion);
+        const entry: Record<string, unknown> = {
+          name: pkg.name,
+          displayName: pkg.displayName,
           version,
-          unity: m.pkg.unity,
-          description: m.pkg.description,
-          dependencies: m.pkg.dependencies ?? {},
-          vpmDependencies: m.pkg.vpmDependencies ?? {},
-          changelogUrl: m.pkg.changelogUrl,
-          author: m.pkg.author,
-          documentationUrl: m.pkg.documentationUrl,
-          keywords: m.pkg.keywords ?? [],
-          unityRelease: m.pkg.unityRelease,
-          zipSHA256: sha,
-          url: asset.browser_download_url,
+          unity: pkg.unity,
+          description: pkg.description,
+          dependencies: pkg.dependencies ?? {},
+          vpmDependencies: pkg.vpmDependencies ?? {},
+          changelogUrl: pkg.changelogUrl,
+          author: pkg.author,
+          documentationUrl: pkg.documentationUrl,
+          keywords: pkg.keywords ?? [],
+          unityRelease: pkg.unityRelease,
+          zipSHA256: info.sha256,
+          url,
         };
+        // Drop undefined fields so the JSON matches the upstream shape.
+        for (const k of Object.keys(entry)) {
+          if (entry[k] === undefined) delete entry[k];
+        }
+
+        const group = packages[pkg.name] ?? (packages[pkg.name] = { versions: {} });
+        group.versions[version] = entry;
       }
     }
   }
@@ -145,7 +175,8 @@ async function getDefaultBranch(env: Env, repo: string): Promise<string> {
 interface Manifest { name: string; pkg: any }
 
 // Every package.json in the repo that looks like a VPM package (name starts
-// com.). Cached for an hour: manifests change far less often than releases.
+// com.). Used only to generate candidate zip names — the authoritative
+// manifest comes from inside each zip, like upstream. Cached for an hour.
 async function getManifests(env: Env, repo: string, branch: string): Promise<Manifest[]> {
   const key = `manifests:${repo}:${branch}`;
   const hit = await env.LISTING_CACHE.get(key, "text");
@@ -184,26 +215,59 @@ async function getReleases(env: Env, repo: string): Promise<any[]> {
   return res.json();
 }
 
-// Release zips are named after the package with dots turned into dashes
-// (com.fttristan.cck-advanced.installer -> com.fttristan.cck-advanced-installer-1.2.3.zip),
-// but plain "{name}-{version}.zip" is a common convention too — try both.
-function findAsset(assets: any[], name: string, version: string): any {
-  const dashed = `${name.replace(/\./g, "-")}-${version}.zip`;
-  const dotted = `${name}-${version}.zip`;
-  return assets.find((a) => a.name === dashed) ?? assets.find((a) => a.name === dotted);
+// A zip is a package candidate when its normalized name starts with the
+// normalized package name followed by a digit. Normalization strips dots
+// and dashes because release pipelines name zips inconsistently — e.g.
+// com.fttristan.cck-advanced.installer ships as
+// "com.fttristan.cck-advanced-installer-0.2.4.zip". The digit requirement
+// keeps sibling artifacts like "com.fttristan.cck-advanced-payload-..."
+// from matching the shorter "com.fttristan.cck-advanced" package name.
+// False positives are harmless: the zip's own package.json decides what
+// actually gets listed.
+function isCandidateZip(assetName: string, pkgName: string): boolean {
+  if (typeof assetName !== "string" || !assetName.endsWith(".zip")) return false;
+  const norm = (s: string) => s.toLowerCase().replace(/[.-]/g, "");
+  const a = norm(assetName);
+  const p = norm(pkgName);
+  if (!p || !a.startsWith(p)) return false;
+  const next = a.charAt(p.length);
+  return next >= "0" && next <= "9";
 }
 
-async function getSha256(env: Env, downloadUrl: string): Promise<string> {
-  const key = `sha256:${downloadUrl}`;
-  const hit = await env.LISTING_CACHE.get(key);
-  if (hit) return hit;
+interface AssetInfo { sha256: string; manifest: any }
 
-  const res = await fetch(downloadUrl);
-  if (!res.ok) throw new Error(`asset ${downloadUrl}: HTTP ${res.status}`);
-  const digest = await crypto.subtle.digest("SHA-256", await res.arrayBuffer());
-  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
-  await env.LISTING_CACHE.put(key, hex, { expirationTtl: SHA_TTL });
-  return hex;
+// Downloads a release zip once, computes its SHA-256 (what VCC verifies)
+// and extracts package.json from the zip root — the same two things
+// HashZipAndReturnManifest does in Build.cs. Cached ~30d: release assets
+// are immutable, so each zip is fetched at most once ever.
+async function getAssetInfo(env: Env, url: string): Promise<AssetInfo | null> {
+  const key = `asset:${url}`;
+  const hit = await env.LISTING_CACHE.get(key, "text");
+  if (hit) return JSON.parse(hit);
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`asset ${url}: HTTP ${res.status}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256 = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+
+  let manifest: any = null;
+  try {
+    // unzipSync is tolerant of the zip64 / data-descriptor variants GitHub
+    // release zips use; a missing or corrupt package.json just yields null.
+    const files = unzipSync(bytes);
+    const raw = files["package.json"];
+    if (raw) manifest = JSON.parse(strFromU8(raw));
+  } catch {
+    manifest = null;
+  }
+
+  const info: AssetInfo = { sha256, manifest };
+  // Cache misses (no manifest) too — otherwise every rebuild would
+  // re-download payload zips that will never become packages.
+  await env.LISTING_CACHE.put(key, JSON.stringify(info), { expirationTtl: ASSET_TTL });
+  return info;
 }
 
 function json(body: string, extraHeaders: Record<string, string> = {}): Response {

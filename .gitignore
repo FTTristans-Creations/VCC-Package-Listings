@@ -2,3 +2,4 @@
 .vscode
 .wrangler/
 Website/source.json
+node_modules/
