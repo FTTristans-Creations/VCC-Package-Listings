@@ -20,9 +20,14 @@
 // Caching (one KV namespace):
 //   index                  -> finished listing JSON, expires after 60s
 //   index:stale            -> last good listing, never expires
+//   index:building         -> rebuild lock, ~2min (best-effort)
 //   repometa:{repo}        -> repo default branch, 1h
 //   manifests:{repo}:{br}  -> discovered package.json manifests, 1h
 //   asset:{url}            -> { sha256, manifest } for a release zip, ~30d
+//
+// Stale-while-revalidate: once `index` expires, requests are served the
+// stale copy immediately while a background task (ctx.waitUntil) rebuilds
+// and repopulates the cache — nobody waits on GitHub.
 //
 // Worst case GitHub traffic is ~1 releases call per repo per minute plus
 // tree/raw fetches only when the hourly manifest cache expires.
@@ -40,34 +45,60 @@ interface Env {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/index.json") {
-      return handleIndex(request, env);
+      return handleIndex(request, env, ctx);
     }
     return env.ASSETS.fetch(request);
   },
 };
 
-async function handleIndex(request: Request, env: Env): Promise<Response> {
+async function handleIndex(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const cached = await env.LISTING_CACHE.get("index", "text");
   if (cached) {
     return json(cached, { "X-Listing-Cache": "hit" });
   }
 
+  const stale = await env.LISTING_CACHE.get("index:stale", "text");
+  if (stale) {
+    // Serve instantly; refresh in the background so the next request
+    // (and VCC clients polling) sees fresh data without waiting on GitHub.
+    scheduleRebuild(request, env, ctx);
+    return json(stale, { "X-Listing-Cache": "stale", "X-Listing-Build": "scheduled" });
+  }
+
+  // Cold start (first deploy ever): nothing to serve but an empty listing,
+  // so build synchronously once.
   try {
     const body = await buildIndex(request, env);
-    // Stale copy first: if a later build fails, errors still serve something.
     await env.LISTING_CACHE.put("index:stale", body);
     await env.LISTING_CACHE.put("index", body, { expirationTtl: LISTING_TTL });
     return json(body, { "X-Listing-Cache": "miss" });
   } catch (err) {
-    const stale = await env.LISTING_CACHE.get("index:stale", "text");
-    if (stale) {
-      return json(stale, { "X-Listing-Cache": "stale", "X-Listing-Error": String(err) });
-    }
     return json(JSON.stringify({ error: String(err) }), { status: 502 });
   }
+}
+
+// Runs buildIndex after the response is sent. A short-lived KV marker
+// keeps concurrent requests from launching duplicate rebuilds; if a build
+// crashes the marker expires on its own.
+function scheduleRebuild(request: Request, env: Env, ctx: ExecutionContext): void {
+  ctx.waitUntil(
+    (async () => {
+      if (await env.LISTING_CACHE.get("index:building")) return;
+      await env.LISTING_CACHE.put("index:building", "1", { expirationTtl: 120 });
+      try {
+        const body = await buildIndex(request, env);
+        await env.LISTING_CACHE.put("index:stale", body);
+        await env.LISTING_CACHE.put("index", body, { expirationTtl: LISTING_TTL });
+      } catch {
+        // Keep serving the stale copy; try again on the next request.
+      } finally {
+        await env.LISTING_CACHE.delete("index:building").catch(() => {});
+      }
+    })()
+  );
 }
 
 async function buildIndex(request: Request, env: Env): Promise<string> {
