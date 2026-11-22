@@ -1,33 +1,81 @@
 import { baseLayerLuminance, StandardLuminance } from 'https://unpkg.com/@fluentui/web-components@2.6.1';
 
-const LISTING_URL = "{{ listingInfo.Url }}";
+// The listing index is generated dynamically (Cloudflare Worker, or the
+// Pages build as a fallback), so derive it from wherever this page is
+// actually being served from.
+const LISTING_URL = `${window.location.origin}/index.json`;
 
-const PACKAGES = {
-{{~ for package in packages ~}}
-  "{{ package.Name }}": {
-    name: "{{ package.Name }}",
-    displayName: "{{ if package.DisplayName; package.DisplayName; end; }}",
-    description: "{{ if package.Description; package.Description; end; }}",
-    version: "{{ package.Version }}",
-    author: {
-      name: "{{ if package.Author.Name; package.Author.Name; end; }}",
-      url: "{{ if package.Author.Url; package.Author.Url; end; }}",
-    },
-    dependencies: {
-      {{~ for dependency in package.Dependencies ~}}
-        "{{ dependency.Name }}": "{{ dependency.Version }}",
-      {{~ end ~}}
-    },
-    keywords: [
-      {{~ for keyword in package.Keywords ~}}
-        "{{ keyword }}",
-      {{~ end ~}}
-    ],
-    license: "{{ package.License }}",
-    licensesUrl: "{{ package.LicensesUrl }}",
-  },
-{{~ end ~}}
+const PACKAGES = {};
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const semverParts = v => String(v).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+const compareSemverDesc = (a, b) => {
+  const pa = semverParts(a), pb = semverParts(b);
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pb[i] - pa[i];
+  }
+  return String(b).localeCompare(String(a));
 };
+
+async function loadPackages() {
+  try {
+    const res = await fetch('index.json');
+    if (!res.ok) throw new Error(`index.json: HTTP ${res.status}`);
+    const listing = await res.json();
+    const grid = document.getElementById('packageGrid');
+    for (const [id, pkg] of Object.entries(listing.packages || {})) {
+      const versions = pkg.versions || {};
+      const latest = Object.keys(versions).sort(compareSemverDesc)[0];
+      if (!latest) continue;
+      const v = versions[latest];
+
+      PACKAGES[id] = {
+        name: id,
+        displayName: v.displayName || id,
+        description: v.description || '',
+        version: latest,
+        author: v.author || { name: '', url: '#' },
+        dependencies: v.dependencies || v.vpmDependencies || {},
+        keywords: v.keywords || [],
+        license: v.license || '',
+        licensesUrl: v.licensesUrl || '',
+      };
+
+      const row = document.createElement('fluent-data-grid-row');
+      row.setAttribute('row-type', 'default');
+      row.setAttribute('data-package-name', v.displayName || id);
+      row.setAttribute('data-package-id', id);
+      row.innerHTML = `
+        <fluent-data-grid-cell grid-column="1">
+          <div class="col">
+            <div class="packageName">${esc(v.displayName || id)}</div>
+            <div class="caption1">${esc(v.description || '')}</div>
+            <div class="caption2">${esc(id)}</div>
+          </div>
+        </fluent-data-grid-cell>
+        <fluent-data-grid-cell grid-column="2" class="row align-items-center">
+          Any
+        </fluent-data-grid-cell>
+        <fluent-data-grid-cell grid-column="3" class="row align-items-center justify-content-end">
+          <fluent-button appearance="accent" class="rowAddToVccButton" data-package-id="${esc(id)}">Add to VCC</fluent-button>
+          <fluent-button title="Package Info" class="rowPackageInfoButton ms-2" data-package-id="${esc(id)}">
+            <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+              <path d="M10.4921 8.91012C10.4497 8.67687 10.2456 8.49999 10.0001 8.49999C9.72397 8.49999 9.50011 8.72385 9.50011 8.99999V13.5021L9.50817 13.592C9.55051 13.8253 9.75465 14.0021 10.0001 14.0021C10.2763 14.0021 10.5001 13.7783 10.5001 13.5021V8.99999L10.4921 8.91012ZM10.7988 6.74999C10.7988 6.33578 10.463 5.99999 10.0488 5.99999C9.63461 5.99999 9.29883 6.33578 9.29883 6.74999C9.29883 7.16421 9.63461 7.49999 10.0488 7.49999C10.463 7.49999 10.7988 7.16421 10.7988 6.74999ZM18 10C18 5.58172 14.4183 2 10 2C5.58172 2 2 5.58172 2 10C2 14.4183 5.58172 18 10 18C14.4183 18 18 14.4183 18 10ZM3 10C3 6.13401 6.13401 3 10 3C13.866 3 17 6.13401 17 10C17 13.866 13.866 17 10 17C6.13401 17 3 13.866 3 10Z"/>
+            </svg>
+          </fluent-button>
+          <fluent-button class="rowMenuButton ms-2" appearance="stealth" data-package-url="${esc(v.url || '')}">
+            <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+              <path d="M6.25 10C6.25 10.6904 5.69036 11.25 5 11.25C4.30964 11.25 3.75 10.6904 3.75 10C3.75 9.30964 4.30964 8.75 5 8.75C5.69036 8.75 6.25 9.30964 6.25 10ZM11.25 10C11.25 10.6904 10.6904 11.25 10 11.25C9.30964 11.25 8.75 10.6904 8.75 10C8.75 9.30964 9.30964 8.75 10 8.75C10.6904 8.75 11.25 9.30964 11.25 10ZM15 11.25C15.6904 11.25 16.25 10.6904 16.25 10C16.25 9.30964 15.6904 8.75 15 8.75C14.3096 8.75 13.75 9.30964 13.75 10C13.75 10.6904 14.3096 11.25 15 11.25Z"/>
+            </svg>
+          </fluent-button>
+        </fluent-data-grid-cell>`;
+      grid.appendChild(row);
+    }
+  } catch (e) {
+    console.error('Failed to load package listing:', e);
+  }
+}
 
 const setTheme = () => {
   const isDarkTheme = () => window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -38,11 +86,17 @@ const setTheme = () => {
   }
 }
 
-(() => {
+(async () => {
   setTheme();
 
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
     setTheme();
+  });
+
+  // Fill the listing-URL fields up front; they don't depend on packages.
+  ['vccUrlField', 'vccListingInfoUrlField', 'packageInfoVccUrlField'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = LISTING_URL;
   });
 
   const packageGrid = document.getElementById('packageGrid');
@@ -81,9 +135,9 @@ const setTheme = () => {
     const vccUrlField = document.getElementById('vccListingInfoUrlField');
     vccUrlField.select();
     navigator.clipboard.writeText(vccUrlField.value);
-    vccUrlFieldCopy.appearance = 'accent';
+    vccListingInfoUrlFieldCopy.appearance = 'accent';
     setTimeout(() => {
-      vccUrlFieldCopy.appearance = 'neutral';
+      vccListingInfoUrlFieldCopy.appearance = 'neutral';
     }, 1000);
   });
 
@@ -108,6 +162,10 @@ const setTheme = () => {
     rowMoreMenu.hidden = true;
   }
 
+  // Rows are rendered by loadPackages(); everything below that queries them
+  // has to wait for it.
+  await loadPackages();
+
   const rowMenuButtons = document.querySelectorAll('.rowMenuButton');
   rowMenuButtons.forEach(button => {
     button.addEventListener('click', e => {
@@ -118,7 +176,7 @@ const setTheme = () => {
 
         const downloadLink = rowMoreMenu.querySelector('#rowMoreMenuDownload');
         const downloadListener = () => {
-          window.open(e?.target?.dataset?.packageUrl, '_blank');
+          window.open(button.dataset?.packageUrl, '_blank');
         }
         downloadLink.addEventListener('change', () => {
           downloadListener();
@@ -161,7 +219,7 @@ const setTheme = () => {
   const rowPackageInfoButton = document.querySelectorAll('.rowPackageInfoButton');
   rowPackageInfoButton.forEach((button) => {
     button.addEventListener('click', e => {
-      const packageId = e.target.dataset?.packageId;
+      const packageId = e.target.dataset?.packageId ?? e.currentTarget?.dataset?.packageId;
       const packageInfo = PACKAGES?.[packageId];
       if (!packageInfo) {
         console.error(`Did not find package ${packageId}. Packages available:`, PACKAGES);
@@ -218,9 +276,9 @@ const setTheme = () => {
     const vccUrlField = document.getElementById('packageInfoVccUrlField');
     vccUrlField.select();
     navigator.clipboard.writeText(vccUrlField.value);
-    vccUrlFieldCopy.appearance = 'accent';
+    packageInfoVccUrlFieldCopy.appearance = 'accent';
     setTimeout(() => {
-      vccUrlFieldCopy.appearance = 'neutral';
+      packageInfoVccUrlFieldCopy.appearance = 'neutral';
     }, 1000);
   });
 
