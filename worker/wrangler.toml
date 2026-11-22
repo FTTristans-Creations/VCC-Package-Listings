@@ -13,6 +13,16 @@ binding = "ASSETS"
 binding = "LISTING_CACHE"
 id = "b94be32e88b748a19dd434b742511dc8"
 
+# Periodic listing rebuild: the ListingBuilder DO's alarm regenerates
+# index.json into KV every ~60s so requests never wait on GitHub.
+[[durable_objects.bindings]]
+name = "LISTING_BUILDER"
+class_name = "ListingBuilder"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ListingBuilder"]
+
 # Optional but recommended: a fine-grained PAT with read-only access to
 # FTTristans-Creations/CCKAdvanced, so the releases call isn't rate-limited
 # by shared Worker egress IPs. Set with:  wrangler secret put GITHUB_TOKEN

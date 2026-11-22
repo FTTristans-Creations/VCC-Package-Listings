@@ -1,8 +1,8 @@
 // VCC package listing Worker.
 //
 // Serves the static landing page from ./Website (wrangler assets binding)
-// and generates index.json on demand from GitHub, driven by source.json
-// (copied into Website/ at deploy time, so it is served as a static asset).
+// and generates index.json from GitHub, driven by source.json (copied into
+// Website/ at deploy time, so it is served as a static asset).
 //
 // Mirrors vrchat-community/package-list-action (PackageBuilder/Build.cs):
 // for every repo in source.json's githubRepos it scans release assets for
@@ -14,32 +14,34 @@
 // Repo manifests are still discovered via the GitHub tree API, but only as
 // a candidate-name filter: upstream downloads EVERY .zip asset (including
 // huge payload archives), which is not viable per-request. A zip is a
-// candidate when its filename starts with "{pkgname}-" (dots or dashes)
-// followed by a digit — matching the "{name}-{version}.zip" convention.
+// candidate when its normalized filename starts with the normalized
+// package name followed by a digit — matching the "{name}-{version}.zip"
+// convention. False positives are harmless: the zip's own package.json
+// decides what actually gets listed.
+//
+// Refresh model: the ListingBuilder Durable Object runs a recurring alarm
+// (~60s) that rebuilds the listing and writes it to KV. Worker requests are
+// pure KV reads — nobody ever waits on GitHub. The listing's `url` field is
+// rewritten to the request origin at serve time, so the builder doesn't
+// need to know the public hostname.
 //
 // Caching (one KV namespace):
-//   index                  -> finished listing JSON, expires after 60s
-//   index:stale            -> last good listing, never expires
-//   index:building         -> rebuild lock, ~2min (best-effort)
+//   index                  -> latest listing JSON, rewritten every ~60s
+//   index:stale            -> same body, kept as a fallback copy
 //   repometa:{repo}        -> repo default branch, 1h
 //   manifests:{repo}:{br}  -> discovered package.json manifests, 1h
 //   asset:{url}            -> { sha256, manifest } for a release zip, ~30d
-//
-// Stale-while-revalidate: once `index` expires, requests are served the
-// stale copy immediately while a background task (ctx.waitUntil) rebuilds
-// and repopulates the cache — nobody waits on GitHub.
-//
-// Worst case GitHub traffic is ~1 releases call per repo per minute plus
-// tree/raw fetches only when the hourly manifest cache expires.
 
+import { DurableObject } from "cloudflare:workers";
 import { unzipSync, strFromU8 } from "fflate";
 
-const LISTING_TTL = 60;            // seconds; ~1 GitHub refresh per minute max
-const META_TTL = 60 * 60;          // repo meta + manifests
+const REBUILD_INTERVAL_MS = 60_000;
+const META_TTL = 60 * 60;            // repo meta + manifests
 const ASSET_TTL = 60 * 60 * 24 * 30; // 30 days; release assets are immutable
 
 interface Env {
   LISTING_CACHE: KVNamespace;
+  LISTING_BUILDER: DurableObjectNamespace;
   ASSETS: Fetcher;
   GITHUB_TOKEN?: string;
 }
@@ -54,55 +56,87 @@ export default {
   },
 };
 
+// Single global builder instance; the alarm survives deploys via DO storage.
+function builderStub(env: Env) {
+  return env.LISTING_BUILDER.get(env.LISTING_BUILDER.idFromName("listing"));
+}
+
 async function handleIndex(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const cached = await env.LISTING_CACHE.get("index", "text");
   if (cached) {
-    return json(cached, { "X-Listing-Cache": "hit" });
+    return listingResponse(cached, request, "hit");
   }
 
   const stale = await env.LISTING_CACHE.get("index:stale", "text");
   if (stale) {
-    // Serve instantly; refresh in the background so the next request
-    // (and VCC clients polling) sees fresh data without waiting on GitHub.
-    scheduleRebuild(request, env, ctx);
-    return json(stale, { "X-Listing-Cache": "stale", "X-Listing-Build": "scheduled" });
+    // Make sure the builder's alarm exists; it self-schedules on first use.
+    ctx.waitUntil(builderStub(env).fetch("https://builder/ensure"));
+    return listingResponse(stale, request, "stale");
   }
 
-  // Cold start (first deploy ever): nothing to serve but an empty listing,
-  // so build synchronously once.
+  // Cold start (first deploy ever): build once synchronously, and make
+  // sure the periodic alarm is armed for subsequent refreshes.
+  ctx.waitUntil(builderStub(env).fetch("https://builder/ensure"));
   try {
-    const body = await buildIndex(request, env);
+    const body = await buildIndex(env);
     await env.LISTING_CACHE.put("index:stale", body);
-    await env.LISTING_CACHE.put("index", body, { expirationTtl: LISTING_TTL });
-    return json(body, { "X-Listing-Cache": "miss" });
+    await env.LISTING_CACHE.put("index", body);
+    return listingResponse(body, request, "miss");
   } catch (err) {
     return json(JSON.stringify({ error: String(err) }), { status: 502 });
   }
 }
 
-// Runs buildIndex after the response is sent. A short-lived KV marker
-// keeps concurrent requests from launching duplicate rebuilds; if a build
-// crashes the marker expires on its own.
-function scheduleRebuild(request: Request, env: Env, ctx: ExecutionContext): void {
-  ctx.waitUntil(
-    (async () => {
-      if (await env.LISTING_CACHE.get("index:building")) return;
-      await env.LISTING_CACHE.put("index:building", "1", { expirationTtl: 120 });
-      try {
-        const body = await buildIndex(request, env);
-        await env.LISTING_CACHE.put("index:stale", body);
-        await env.LISTING_CACHE.put("index", body, { expirationTtl: LISTING_TTL });
-      } catch {
-        // Keep serving the stale copy; try again on the next request.
-      } finally {
-        await env.LISTING_CACHE.delete("index:building").catch(() => {});
-      }
-    })()
-  );
+// Serves cached listing JSON with `url` pointed at this request's origin,
+// so the same stored body works on workers.dev, a custom domain, or Pages.
+function listingResponse(body: string, request: Request, status: string): Response {
+  try {
+    const data = JSON.parse(body);
+    data.url = `${new URL(request.url).origin}/index.json`;
+    body = JSON.stringify(data);
+  } catch {
+    // Malformed cache entry — serve it as-is rather than failing.
+  }
+  return json(body, { "X-Listing-Cache": status });
 }
 
-async function buildIndex(request: Request, env: Env): Promise<string> {
-  const cfg = await getSourceConfig(request, env);
+export class ListingBuilder extends DurableObject<Env> {
+  // Recurring rebuild. Always reschedules, even on failure — a bad GitHub
+  // hour shouldn't permanently kill refresh.
+  async alarm(): Promise<void> {
+    try {
+      await this.rebuild();
+    } finally {
+      await this.ctx.storage.setAlarm(Date.now() + REBUILD_INTERVAL_MS);
+    }
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path === "/ensure") {
+      // Arm the alarm if it isn't already; firing "now" bootstraps the
+      // first build without waiting a full interval.
+      if ((await this.ctx.storage.getAlarm()) === null) {
+        await this.ctx.storage.setAlarm(Date.now());
+      }
+      return new Response("ok");
+    }
+    if (path === "/rebuild") {
+      await this.rebuild();
+      return new Response("ok");
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  private async rebuild(): Promise<void> {
+    const body = await buildIndex(this.env);
+    await this.env.LISTING_CACHE.put("index:stale", body);
+    await this.env.LISTING_CACHE.put("index", body);
+  }
+}
+
+async function buildIndex(env: Env): Promise<string> {
+  const cfg = await getSourceConfig(env);
   const repos: string[] = cfg.githubRepos ?? [];
 
   const packages: Record<string, { versions: Record<string, unknown> }> = {};
@@ -162,11 +196,9 @@ async function buildIndex(request: Request, env: Env): Promise<string> {
     }
   }
 
-  const origin = new URL(request.url).origin;
   return JSON.stringify({
     name: cfg.name,
     author: typeof cfg.author === "string" ? cfg.author : cfg.author?.name,
-    url: `${origin}/index.json`,
     id: cfg.id,
     packages,
   });
@@ -175,9 +207,8 @@ async function buildIndex(request: Request, env: Env): Promise<string> {
 // The listing's own config, served as a static asset (deploy copies
 // source.json into Website/). Not cached in KV: asset fetches are cheap
 // and this way config changes take effect on the next deploy.
-async function getSourceConfig(request: Request, env: Env): Promise<any> {
-  const assetUrl = new URL("/source.json", request.url).toString();
-  const res = await env.ASSETS.fetch(new Request(assetUrl));
+async function getSourceConfig(env: Env): Promise<any> {
+  const res = await env.ASSETS.fetch(new Request("https://assets.local/source.json"));
   if (!res.ok) throw new Error(`source.json asset: HTTP ${res.status}`);
   return res.json();
 }
