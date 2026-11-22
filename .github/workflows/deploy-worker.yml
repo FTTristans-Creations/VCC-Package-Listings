@@ -23,6 +23,7 @@ jobs:
           node-version: 22
 
       - name: Stage source.json for the Worker
+        working-directory: ${{ github.workspace }}
         run: cp source.json Website/source.json
 
       - name: Deploy Worker
