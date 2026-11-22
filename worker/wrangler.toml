@@ -11,7 +11,7 @@ binding = "ASSETS"
 # then paste the returned id below.
 [[kv_namespaces]]
 binding = "LISTING_CACHE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "b94be32e88b748a19dd434b742511dc8"
 
 # Optional but recommended: a fine-grained PAT with read-only access to
 # FTTristans-Creations/CCKAdvanced, so the releases call isn't rate-limited
