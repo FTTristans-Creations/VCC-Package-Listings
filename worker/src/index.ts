@@ -20,7 +20,7 @@
 // decides what actually gets listed.
 //
 // Refresh model: the ListingBuilder Durable Object runs a recurring alarm
-// (jittered 3-5min to keep KV writes and GitHub calls well under daily
+// (fixed 3min interval to keep KV writes and GitHub calls well under daily
 // quotas) that rebuilds the listing and writes it to KV. Worker requests
 // are pure reads — an isolate-level in-memory cache (MEM_TTL) absorbs
 // repeat reads so KV is only touched once per minute per isolate at most.
@@ -28,7 +28,7 @@
 // time, so the builder doesn't need to know the public hostname.
 //
 // Caching (one KV namespace):
-//   index                  -> latest listing JSON, rewritten every ~3-5min
+//   index                  -> latest listing JSON, rewritten every ~3min
 //   index:stale            -> same body, kept as a fallback copy
 //   repometa:{repo}        -> repo default branch, 1h
 //   manifests:{repo}:{br}  -> discovered package.json manifests, 1h
@@ -37,8 +37,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { unzipSync, strFromU8 } from "fflate";
 
-const REBUILD_MIN_MS = 3 * 60_000;
-const REBUILD_MAX_MS = 5 * 60_000;
+const REBUILD_INTERVAL_MS = 3 * 60_000;
 const MEM_TTL_MS = 60_000;          // isolate memory cache for index reads
 const META_TTL = 60 * 60;            // repo meta + manifests
 const ASSET_TTL = 60 * 60 * 24 * 30; // 30 days; release assets are immutable
@@ -116,14 +115,12 @@ function listingResponse(body: string, request: Request, status: string): Respon
 
 export class ListingBuilder extends DurableObject<Env> {
   // Recurring rebuild. Always reschedules, even on failure — a bad GitHub
-  // hour shouldn't permanently kill refresh. Jitter spreads rebuilds so
-  // they don't all land on the same minute boundary.
+  // hour shouldn't permanently kill refresh.
   async alarm(): Promise<void> {
     try {
       await this.rebuild();
     } finally {
-      const jitter = REBUILD_MIN_MS + Math.floor(Math.random() * (REBUILD_MAX_MS - REBUILD_MIN_MS));
-      await this.ctx.storage.setAlarm(Date.now() + jitter);
+      await this.ctx.storage.setAlarm(Date.now() + REBUILD_INTERVAL_MS);
     }
   }
 
