@@ -64,9 +64,20 @@ Point VCC at `https://<your-worker-url>/index.json` as the listing URL.
 
 ## Adding another package/repo later
 
-Edit `REPO`, `PACKAGE_NAME`, and `PKG_JSON_URL` in `src/index.ts` — or
-extend `buildIndex` to loop over a repo list. The per-version metadata
-currently comes from the installer's `package.json` on `main`.
+Edit `source.json` at the repo root — no Worker changes needed:
+
+- **`githubRepos`** — add a repo and the Worker discovers every
+  `package.json` in it (name starting `com.`), then lists each release
+  that ships a `{package-name}-{version}.zip` asset (dots or dashes).
+  Package metadata comes from that `package.json` on the default branch.
+- **`packages`** — for zips hosted outside GitHub (not implemented yet).
+
+Manifests and repo metadata are cached in KV for 1h; the listing itself
+for 60s; asset hashes effectively forever.
+
+The deploy workflow copies `source.json` into `Website/` before
+`wrangler deploy`, so the Worker reads the same commit's config via the
+assets binding (`/source.json`).
 
 ## Retiring the Pages build
 
